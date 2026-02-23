@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: jt-tracking-bot     # đổi tên tùy ý
+    env: python
+    plan: free
+    branch: main              # hoặc master
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "5000"         # Render sẽ override bằng biến PORT thật
+    healthCheckPath: /        # route trả về text đơn giản
+    autoDeploy: true
