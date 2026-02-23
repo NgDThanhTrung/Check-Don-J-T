@@ -2,7 +2,6 @@ services:
   - type: web
     name: jt-tracking-bot
     env: python
-    pythonVersion: 3.12
     plan: free
     branch: main
     buildCommand: pip install -r requirements.txt
