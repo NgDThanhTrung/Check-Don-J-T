@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: jt-tracking-bot          # Bạn có thể đổi tên này nếu muốn
+    env: python
+    pythonVersion: 3.12            # Quan trọng: dùng 3.12 để greenlet compile thành công
+    plan: free                     # Nếu bạn dùng free tier, giữ nguyên; nếu Starter thì đổi thành "starter"
+    branch: main                   # branch chính của bạn (thường là main hoặc master)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false                  # Bạn sẽ set thủ công trên dashboard sau khi deploy
+      - key: PYTHONUNBUFFERED
+        value: "1"                   # Giúp log hiển thị realtime
+      - key: PORT
+        value: "5000"                # Render sẽ override bằng $PORT thật, nhưng set để an toàn
+
+    healthCheckPath: /               # Route / trả về "Bot đang chạy!" để Render check health
+    autoDeploy: true                 # Tự động deploy khi push code mới
