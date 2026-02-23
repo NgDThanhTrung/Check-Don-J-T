@@ -1,147 +1,162 @@
 import os
 import logging
-import requests
-from bs4 import BeautifulSoup
+import time
 from flask import Flask, request, abort
 import telebot
+from telebot import types
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# Logging để xem lỗi trên Render dashboard
+# Logging để debug trên Render
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Lấy token từ biến môi trường (phải set trên Render)
+# Token từ biến môi trường Render
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 if not TOKEN:
-    raise ValueError("TELEGRAM_TOKEN chưa được thiết lập trong Environment Variables!")
+    raise ValueError("TELEGRAM_TOKEN chưa được set trong Environment Variables!")
 
-# Khởi tạo bot - threaded=False rất quan trọng trên Render free tier
-bot = telebot.TeleBot(TOKEN, threaded=False)
+bot = telebot.TeleBot(TOKEN, threaded=False)  # threaded=False rất quan trọng cho Render free tier
 
 app = Flask(__name__)
 
-# Tự động lấy domain Render cung cấp hoặc dùng biến môi trường
+# Webhook URL dùng domain Render cung cấp
 RENDER_HOST = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
 if not RENDER_HOST:
-    raise ValueError("Không tìm thấy RENDER_EXTERNAL_HOSTNAME - kiểm tra lại trên Render")
+    raise ValueError("RENDER_EXTERNAL_HOSTNAME không tồn tại - kiểm tra lại trên Render")
 
-WEBHOOK_URL = f"https://{RENDER_HOST}/{TOKEN}"  # dùng token làm path để an toàn hơn
+WEBHOOK_URL = f"https://{RENDER_HOST}/{TOKEN}"
+
+def init_driver():
+    options = uc.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    driver = uc.Chrome(options=options, use_subprocess=True)
+    return driver
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message,
-                 "Xin chào! Đây là bot tra cứu tình trạng đơn hàng J&T Express Việt Nam.\n\n"
-                 "Cách dùng:\n"
-                 "/check <mã vận đơn> <4 số cuối số điện thoại>\n"
-                 "Ví dụ: /check JT123456789VN 6789")
-
+                 "Xin chào! Bot tra cứu tình trạng đơn hàng J&T Express.\n\n"
+                 "Lệnh:\n"
+                 "/check <mã vận đơn> <4 số cuối SĐT>\n"
+                 "Ví dụ: /check 861396533622 6719")
 
 @bot.message_handler(commands=['check'])
-def handle_check(message):
+def check_tracking(message):
     try:
-        text_parts = message.text.strip().split()
-        if len(text_parts) != 3:
-            bot.reply_to(message, "Cú pháp sai!\nDùng: /check <mã đơn> <4 số cuối SĐT>\nVí dụ: /check JT123456789VN 6789")
+        parts = message.text.strip().split()
+        if len(parts) != 3:
+            bot.reply_to(message, "Sai cú pháp!\nDùng: /check <mã đơn> <4 số cuối SĐT>")
             return
 
-        _, billcode, cellphone = text_parts
+        _, billcode, cellphone = parts
 
         if len(cellphone) != 4 or not cellphone.isdigit():
-            bot.reply_to(message, "4 số cuối số điện thoại phải là 4 chữ số!")
+            bot.reply_to(message, "4 số cuối SĐT phải là 4 chữ số!")
             return
 
         url = f"https://jtexpress.vn/vi/tracking?type=track&billcode={billcode}&cellphone={cellphone}"
 
-        bot.reply_to(message, f"Đang tra cứu đơn {billcode}... ⏳")
+        bot.reply_to(message, f"Đang tra cứu đơn {billcode}... ⏳ (có thể mất 10-40 giây)")
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
+        driver = init_driver()
+        try:
+            driver.get(url)
 
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
+            # Chờ phần result-vandon-item xuất hiện → đảm bảo JS load xong
+            WebDriverWait(driver, 40).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "result-vandon-item"))
+            )
+            time.sleep(2)  # buffer an toàn
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+            # Tìm tab-content (nếu không có thì fallback lấy body)
+            try:
+                tab_content = driver.find_element(By.CLASS_NAME, "tab-content")
+            except:
+                tab_content = driver.find_element(By.TAG_NAME, "body")
+                logger.warning("Không tìm thấy .tab-content, fallback dùng body")
 
-        # =======================
-        # Phần lấy dữ liệu tracking - cần điều chỉnh nếu J&T thay đổi giao diện
-        # =======================
-        status_text = ""
+            # Lấy tất cả các item trạng thái
+            items = tab_content.find_elements(By.CLASS_NAME, "result-vandon-item")
 
-        # Thử các class phổ biến trên trang J&T
-        candidates = [
-            soup.find('div', class_='tracking-detail'),
-            soup.find('div', class_='status-detail'),
-            soup.find('div', class_='timeline'),
-            soup.find('div', class_='tracking-info'),
-            soup.find('section', class_='tracking-section'),
-        ]
+            if not items:
+                bot.reply_to(message, "Không tìm thấy thông tin trạng thái đơn hàng.\nCó thể mã đơn / số ĐT sai hoặc trang đang lỗi.")
+                return
 
-        for candidate in candidates:
-            if candidate:
-                status_text = candidate.get_text(separator='\n', strip=True)
-                break
+            status_lines = []
+            for item in items:
+                try:
+                    # Lấy thời gian và ngày (thường là 2 span SFProDisplayBold)
+                    time_elements = item.find_elements(By.CSS_SELECTOR, "span.text-[14px].SFProDisplayBold")
+                    time_part = time_elements[0].text.strip() if time_elements else ""
+                    date_part = time_elements[1].text.strip() if len(time_elements) > 1 else ""
 
-        # Nếu không tìm thấy → fallback lấy text chính trong body
-        if not status_text:
-            body = soup.body
-            if body:
-                lines = []
-                for line in body.get_text(separator='\n').split('\n'):
-                    cleaned = line.strip()
-                    if len(cleaned) > 10 and 'footer' not in cleaned.lower() and 'header' not in cleaned.lower():
-                        lines.append(cleaned)
-                status_text = '\n'.join(lines[:30])  # giới hạn để tránh quá dài
+                    # Lấy phần mô tả trạng thái (div cuối cùng trong item)
+                    description_divs = item.find_elements(By.TAG_NAME, "div")
+                    description = description_divs[-1].text.strip() if description_divs else "Không có mô tả"
 
-        if not status_text.strip():
-            status_text = "Không tìm thấy thông tin tracking.\nCó thể mã đơn hoặc số điện thoại không đúng, hoặc trang web đang lỗi."
+                    line = f"{date_part} {time_part}: {description}"
+                    status_lines.append(line.strip())
 
-        # Giới hạn độ dài tin nhắn Telegram
-        if len(status_text) > 3500:
-            status_text = status_text[:3450] + "\n... (xem chi tiết trên website)"
+                except Exception as e:
+                    logger.debug(f"Lỗi parse 1 item: {e}")
+                    continue
 
-        reply = (
-            f"📦 **Đơn hàng: {billcode}**\n"
-            f"📱 SĐT: ****{cellphone}\n\n"
-            f"{status_text}"
-        )
+            if not status_lines:
+                bot.reply_to(message, "Không trích xuất được trạng thái chi tiết.")
+                return
 
-        bot.reply_to(message, reply, parse_mode='Markdown')
+            # Ghép kết quả
+            reply = (
+                f"📦 **Tình trạng đơn hàng {billcode}**\n"
+                f"   SĐT: ****{cellphone}\n\n"
+                + "\n".join(status_lines) + "\n\n"
+                f"(Nguồn: J&T Express - cập nhật lúc {time.strftime('%H:%M %d/%m/%Y')})"
+            )
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Lỗi request: {e}")
-        bot.reply_to(message, "Không kết nối được với J&T Express. Thử lại sau vài phút nhé.")
+            if len(reply) > 3800:
+                reply = reply[:3750] + "\n... (quá dài, xem đầy đủ trên website J&T)"
+
+            bot.reply_to(message, reply)
+
+        finally:
+            driver.quit()
+
     except Exception as e:
-        logger.error(f"Lỗi không xác định: {e}", exc_info=True)
-        bot.reply_to(message, f"Có lỗi xảy ra: {str(e)}\nVui lòng thử lại hoặc liên hệ admin.")
+        logger.error(f"Lỗi tổng thể khi check: {e}", exc_info=True)
+        bot.reply_to(message, f"Lỗi xảy ra: {str(e)[:150]}\nThử lại sau vài phút hoặc kiểm tra mã đơn.")
 
-
-# Route webhook - Telegram sẽ gửi POST request đến đây
+# Webhook route
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
+        update = types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return 'OK', 200
-    else:
-        abort(403)
-
+    abort(403)
 
 @app.route('/')
 def index():
-    return "Bot tra cứu J&T Express đang hoạt động trên Render!"
-
+    return "Bot tra cứu J&T Express (Selenium) đang hoạt động!"
 
 if __name__ == "__main__":
-    # Xóa webhook cũ và set webhook mới khi khởi động
     try:
         bot.remove_webhook()
         bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook đã được thiết lập: {WEBHOOK_URL}")
+        logger.info(f"Webhook đã set thành công: {WEBHOOK_URL}")
     except Exception as e:
-        logger.error(f"Lỗi khi set webhook: {e}")
+        logger.error(f"Lỗi set webhook: {e}")
 
-    # Chạy Flask
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
