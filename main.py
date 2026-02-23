@@ -9,24 +9,24 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Logging để debug trên Render
+# Logging để xem lỗi trên Render
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Token từ biến môi trường Render
+# Token từ Environment Variables
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 if not TOKEN:
-    raise ValueError("TELEGRAM_TOKEN chưa được set trong Environment Variables!")
+    raise ValueError("TELEGRAM_TOKEN chưa được set!")
 
-bot = telebot.TeleBot(TOKEN, threaded=False)  # threaded=False rất quan trọng cho Render free tier
+bot = telebot.TeleBot(TOKEN, threaded=False)  # threaded=False cho Render free
 
 app = Flask(__name__)
 
-# Webhook URL dùng domain Render cung cấp
+# Webhook dùng domain Render cung cấp
 RENDER_HOST = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
 if not RENDER_HOST:
-    raise ValueError("RENDER_EXTERNAL_HOSTNAME không tồn tại - kiểm tra lại trên Render")
+    raise ValueError("RENDER_EXTERNAL_HOSTNAME không tồn tại!")
 
 WEBHOOK_URL = f"https://{RENDER_HOST}/{TOKEN}"
 
@@ -38,17 +38,29 @@ def init_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    return driver
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-extensions")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+    try:
+        driver = uc.Chrome(
+            options=options,
+            use_subprocess=True,
+            version_main=128,                   # Chỉ định version Chrome ổn định (có thể thử 120, 121, 128)
+            browser_executable_path=None,       # Tự tải Chromium nếu cần
+            driver_executable_path=None         # Tự tải chromedriver
+        )
+        logger.info("undetected_chromedriver khởi tạo thành công")
+        return driver
+    except Exception as e:
+        logger.error(f"Lỗi khởi tạo driver: {e}")
+        raise
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message,
-                 "Xin chào! Bot tra cứu tình trạng đơn hàng J&T Express.\n\n"
-                 "Lệnh:\n"
-                 "/check <mã vận đơn> <4 số cuối SĐT>\n"
+                 "Xin chào! Bot tra cứu tình trạng đơn J&T Express.\n\n"
+                 "Lệnh: /check <mã vận đơn> <4 số cuối SĐT>\n"
                  "Ví dụ: /check 861396533622 6719")
 
 @bot.message_handler(commands=['check'])
@@ -56,7 +68,7 @@ def check_tracking(message):
     try:
         parts = message.text.strip().split()
         if len(parts) != 3:
-            bot.reply_to(message, "Sai cú pháp!\nDùng: /check <mã đơn> <4 số cuối SĐT>")
+            bot.reply_to(message, "Sai cú pháp! Dùng: /check <mã đơn> <4 số cuối SĐT>")
             return
 
         _, billcode, cellphone = parts
@@ -67,65 +79,63 @@ def check_tracking(message):
 
         url = f"https://jtexpress.vn/vi/tracking?type=track&billcode={billcode}&cellphone={cellphone}"
 
-        bot.reply_to(message, f"Đang tra cứu đơn {billcode}... ⏳ (có thể mất 10-40 giây)")
+        bot.reply_to(message, f"Đang tra cứu đơn {billcode}... ⏳ (có thể mất 15-50 giây)")
 
         driver = init_driver()
         try:
             driver.get(url)
 
-            # Chờ phần result-vandon-item xuất hiện → đảm bảo JS load xong
-            WebDriverWait(driver, 40).until(
+            # Chờ phần kết quả tracking load
+            WebDriverWait(driver, 45).until(
                 EC.presence_of_element_located((By.CLASS_NAME, "result-vandon-item"))
             )
-            time.sleep(2)  # buffer an toàn
+            time.sleep(3)  # chờ render thêm
 
-            # Tìm tab-content (nếu không có thì fallback lấy body)
+            # Tìm tab-content hoặc fallback body
             try:
-                tab_content = driver.find_element(By.CLASS_NAME, "tab-content")
+                container = driver.find_element(By.CLASS_NAME, "tab-content")
             except:
-                tab_content = driver.find_element(By.TAG_NAME, "body")
-                logger.warning("Không tìm thấy .tab-content, fallback dùng body")
+                container = driver.find_element(By.TAG_NAME, "body")
+                logger.warning("Không tìm thấy tab-content → dùng body")
 
-            # Lấy tất cả các item trạng thái
-            items = tab_content.find_elements(By.CLASS_NAME, "result-vandon-item")
+            # Lấy tất cả item trạng thái
+            items = container.find_elements(By.CLASS_NAME, "result-vandon-item")
 
             if not items:
-                bot.reply_to(message, "Không tìm thấy thông tin trạng thái đơn hàng.\nCó thể mã đơn / số ĐT sai hoặc trang đang lỗi.")
+                bot.reply_to(message, "Không tìm thấy thông tin trạng thái.\nKiểm tra mã đơn / SĐT hoặc trang lỗi.")
                 return
 
             status_lines = []
             for item in items:
                 try:
-                    # Lấy thời gian và ngày (thường là 2 span SFProDisplayBold)
-                    time_elements = item.find_elements(By.CSS_SELECTOR, "span.text-[14px].SFProDisplayBold")
-                    time_part = time_elements[0].text.strip() if time_elements else ""
-                    date_part = time_elements[1].text.strip() if len(time_elements) > 1 else ""
+                    # Thời gian + ngày
+                    time_spans = item.find_elements(By.CSS_SELECTOR, "span.text-[14px].SFProDisplayBold")
+                    time_str = time_spans[0].text.strip() if time_spans else ""
+                    date_str = time_spans[1].text.strip() if len(time_spans) > 1 else ""
 
-                    # Lấy phần mô tả trạng thái (div cuối cùng trong item)
-                    description_divs = item.find_elements(By.TAG_NAME, "div")
-                    description = description_divs[-1].text.strip() if description_divs else "Không có mô tả"
+                    # Mô tả trạng thái (div cuối)
+                    desc_div = item.find_elements(By.TAG_NAME, "div")[-1]
+                    desc = desc_div.text.strip() if desc_div else "Không có mô tả"
 
-                    line = f"{date_part} {time_part}: {description}"
-                    status_lines.append(line.strip())
-
-                except Exception as e:
-                    logger.debug(f"Lỗi parse 1 item: {e}")
+                    line = f"{date_str} {time_str}: {desc}"
+                    if line.strip():
+                        status_lines.append(line)
+                except:
                     continue
 
             if not status_lines:
-                bot.reply_to(message, "Không trích xuất được trạng thái chi tiết.")
+                bot.reply_to(message, "Không trích xuất được chi tiết trạng thái.")
                 return
 
-            # Ghép kết quả
             reply = (
-                f"📦 **Tình trạng đơn hàng {billcode}**\n"
+                f"📦 **Tình trạng đơn {billcode}**\n"
                 f"   SĐT: ****{cellphone}\n\n"
                 + "\n".join(status_lines) + "\n\n"
-                f"(Nguồn: J&T Express - cập nhật lúc {time.strftime('%H:%M %d/%m/%Y')})"
+                f"(Cập nhật từ J&T Express - {time.strftime('%d/%m/%Y %H:%M')})"
             )
 
             if len(reply) > 3800:
-                reply = reply[:3750] + "\n... (quá dài, xem đầy đủ trên website J&T)"
+                reply = reply[:3750] + "\n... (xem đầy đủ trên web)"
 
             bot.reply_to(message, reply)
 
@@ -133,10 +143,10 @@ def check_tracking(message):
             driver.quit()
 
     except Exception as e:
-        logger.error(f"Lỗi tổng thể khi check: {e}", exc_info=True)
+        logger.error(f"Lỗi tổng: {e}", exc_info=True)
         bot.reply_to(message, f"Lỗi xảy ra: {str(e)[:150]}\nThử lại sau vài phút hoặc kiểm tra mã đơn.")
 
-# Webhook route
+# Webhook
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -148,15 +158,15 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Bot tra cứu J&T Express (Selenium) đang hoạt động!"
+    return "Bot J&T Tracking đang chạy!"
 
 if __name__ == "__main__":
     try:
         bot.remove_webhook()
         bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook đã set thành công: {WEBHOOK_URL}")
+        logger.info(f"Webhook set: {WEBHOOK_URL}")
     except Exception as e:
-        logger.error(f"Lỗi set webhook: {e}")
+        logger.error(f"Webhook lỗi: {e}")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
